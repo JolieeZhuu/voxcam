@@ -26,13 +26,14 @@ import argparse
 import os
 import sys
 from pathlib import Path
-
-# Enable CPU fallback for any unsupported MPS operators on Apple Silicon
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-
+import pickle
 import numpy as np
 
-# ── Resolve MASt3R imports ──────────────────────────────────────────
+
+# CPU fallback if no NVIDIA GPU
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# Auto-call shell/powershell script for imports
 SCRIPT_DIR = Path(__file__).resolve().parent
 MAST3R_DIR = SCRIPT_DIR / "mast3r"
 
@@ -62,6 +63,7 @@ DEFAULT_SDF_TRUNC_MULT = 5    # sdf_trunc = voxel_length * this
 DEFAULT_CONFIDENCE_THR = 1.5  # Min confidence to include a point
 DEFAULT_MAX_IMAGES = 30       # Cap on number of images (GPU memory)
 DEFAULT_SCENE_GRAPH = "swin-5" # Scene graph type for pair selection
+DEFAULT_BATCH_SIZE = 1        # No. of pairs to be inferred simultaneously
 
 
 def get_default_device() -> str:
@@ -141,6 +143,12 @@ def parse_args():
         type=float,
         default=DEFAULT_CONFIDENCE_THR,
         help="Minimum confidence to include a 3D point (default: 1.5).",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help="Number of pairs of images for model to infer simultaneously (default: 1)."
     )
     parser.add_argument(
         "--device",
@@ -258,7 +266,7 @@ def run_mast3r_inference(image_paths, args, modules):
 
     # Run pairwise inference
     print("Running MASt3R pairwise inference...")
-    output = inference_fn(pairs, model, args.device, batch_size=1)
+    output = inference_fn(pairs, model, args.device, batch_size=args.batch_size)
     print("Pairwise inference complete.")
 
     # Global alignment
@@ -348,6 +356,13 @@ def extract_scene_data(scene, confidence_threshold: float):
 
     total_pts = sum(m.sum() for m in masks)
     print(f"Extracted {len(pts3d_list)} views, {total_pts:,} points above confidence threshold.")
+
+
+    # checking for confidence values
+    print("check for confidence values")
+    for i, (c, m) in enumerate(zip(confidence_list, masks)):
+        print(f"view {i}: conf min={c.min():.3f} med={np.median(c):.3f} max={c.max():.3f}, kept={m.mean():.1%}")
+
 
     return {
         "pts3d_list": pts3d_list,
@@ -525,6 +540,11 @@ def tsdf_integrate(scene_data, voxel_length: float, sdf_trunc_mult: float = 5):
         valid_px = int(np.sum(depth > 0))
         print(f"  Integrated view {i + 1}/{n_views}  "
               f"(valid pixels: {valid_px:,})")
+        
+    # first debug
+    # print("FIRST DEBUG ============")
+    # print(len(tsdf_volume.extract_voxel_point_cloud().points))
+    # print(len(tsdf_volume.extract_point_cloud().points))
 
     # Extract mesh
     print("Extracting mesh from TSDF volume (Marching Cubes)...")
@@ -546,7 +566,7 @@ def tsdf_integrate(scene_data, voxel_length: float, sdf_trunc_mult: float = 5):
 
 # ── Step 6: Alternative mesh via Poisson reconstruction ─────────────
 
-def poisson_reconstruct(pcd, depth: int = 10):
+def poisson_reconstruct(pcd, depth: int = 8):
     """
     Fallback: Poisson surface reconstruction from the point cloud.
     Also tends to produce watertight meshes.
@@ -658,6 +678,7 @@ def main():
     print(f"  Image size:       {args.image_size}")
     print(f"  Voxel length:     {args.voxel_length}")
     print(f"  Confidence thr:   {args.confidence_threshold}")
+    print(f"  Confidence thr:   {args.batch_size}")
     print("=" * 60)
 
     # Import MASt3R modules
@@ -673,9 +694,13 @@ def main():
 
     # Step 3: Extract aligned data
     scene_data = extract_scene_data(scene, args.confidence_threshold)
+    
+    # store scene data
+    pickle.dump(scene_data, open(args.output_dir / "scene_data.pkl", "wb"))
 
     # Step 4: Export raw point cloud
     pcd = export_point_cloud(scene_data, args.output_dir)
+    # print("Export raw point cloud complete!")
 
     if args.skip_tsdf:
         print("\n--skip_tsdf specified. Skipping TSDF meshing.")
